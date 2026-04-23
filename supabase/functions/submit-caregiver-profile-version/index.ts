@@ -48,27 +48,13 @@ serve(async (req) => {
       return jsonResponse({ error: "Missing or invalid Authorization header" }, 401);
     }
 
-    const token = authHeader.replace("Bearer ", "").trim();
-
-    const userClient = createClient(supabaseUrl, anonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
-
     const adminClient = createClient(supabaseUrl, serviceRoleKey);
+    const token = authHeader.replace("Bearer ", "").trim();
+    const jwtPayload = decodeJwtPayload(token);
+    const userId = String(jwtPayload?.sub || "").trim();
 
-    const {
-      data: { user },
-      error: authError,
-    } = await userClient.auth.getUser(token);
-
-    if (authError || !user) {
-      return jsonResponse(
-        {
-          error: "Unauthorized",
-          details: authError?.message || "No user returned from token",
-        },
-        401,
-      );
+    if (!userId) {
+      return jsonResponse({ error: "Unauthorized", details: "Token did not include a user id" }, 401);
     }
 
     const body = (await req.json()) as RequestBody;
@@ -80,11 +66,6 @@ serve(async (req) => {
     const bio = (body.bio || "").trim();
     const careTypes = Array.isArray(body.care_types) ? body.care_types.filter(Boolean) : [];
     const photoUrls = Array.isArray(body.photo_urls) ? body.photo_urls.filter(Boolean).slice(0, 5) : [];
-
-    const accountFirstName = String(user.user_metadata?.first_name || "").trim();
-    const accountLastName = String(user.user_metadata?.last_name || "").trim();
-    const accountPhone = String(user.user_metadata?.phone || user.user_metadata?.phone_number || "").trim();
-    const accountEmail = user.email || "";
 
     if (!displayName) {
       return jsonResponse({ error: "name_display is required" }, 400);
@@ -102,13 +83,12 @@ serve(async (req) => {
 
     const parent = await getOrCreateCaregiverProfile(
       adminClient,
-      user.id,
-      accountEmail,
+      userId,
       displayName,
       body.caregiver_profile_id,
     );
 
-    const risk = await getOrCreateUserRiskProfile(adminClient, user.id);
+    const risk = await getOrCreateUserRiskProfile(adminClient, userId);
     const accountIsQueued = risk.account_status === "queued";
 
     const contentStatus = accountIsQueued ? "queued" : "published";
@@ -128,8 +108,6 @@ serve(async (req) => {
       version_number: nextVersion,
       submitted_at: nowIso,
       name_display: displayName,
-      email: accountEmail,
-      phone: accountPhone || null,
       location,
       care_types: careTypes,
       care_type: careTypes[0],
@@ -144,8 +122,6 @@ serve(async (req) => {
       bio: bio || null,
       photo_urls: photoUrls,
       photo_url: photoUrls[0] || null,
-      first_name: accountFirstName || null,
-      last_name: accountLastName || null,
       content_status: contentStatus,
       review_status: reviewStatus,
       is_live: isLive,
@@ -169,10 +145,6 @@ serve(async (req) => {
 
     const update: Record<string, unknown> = {
       name_display: displayName,
-      email: accountEmail,
-      phone: accountPhone || null,
-      first_name: accountFirstName || null,
-      last_name: accountLastName || null,
       location,
       care_types: careTypes,
       care_type: careTypes[0],
@@ -212,7 +184,7 @@ serve(async (req) => {
 
     if (contentStatus === "queued") {
       await createQueueItemIfMissing(adminClient, {
-        userId: user.id,
+        userId,
         queueType: "caregiver_profile",
         summary: `Queued caregiver profile: ${displayName}`,
         relatedTable: "caregiver_profile_versions",
@@ -276,7 +248,6 @@ async function supersede(
 async function getOrCreateCaregiverProfile(
   adminClient: ReturnType<typeof createClient>,
   userId: string,
-  email: string,
   displayName: string,
   caregiverProfileId?: string,
 ) {
@@ -315,11 +286,9 @@ async function getOrCreateCaregiverProfile(
     .from("caregiver_profiles")
     .insert({
       user_id: userId,
-      email,
       name_display: displayName,
       is_active: false,
       confirmed_encounters: 0,
-      visible_profile_status: "hidden",
     })
     .select("*")
     .single();
@@ -462,4 +431,16 @@ function jsonResponse(payload: unknown, status = 200) {
       "Content-Type": "application/json",
     },
   });
+}
+
+function decodeJwtPayload(token: string) {
+  try {
+    const [, payloadSegment] = token.split(".");
+    if (!payloadSegment) return null;
+    const normalized = payloadSegment.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
 }

@@ -47,27 +47,13 @@ serve(async (req) => {
       return jsonResponse({ error: "Missing or invalid Authorization header" }, 401);
     }
 
-    const token = authHeader.replace("Bearer ", "").trim();
-
-    const userClient = createClient(supabaseUrl, anonKey, {
-      global: { headers: { Authorization: authHeader } },
-    });
-
     const adminClient = createClient(supabaseUrl, serviceRoleKey);
+    const token = authHeader.replace("Bearer ", "").trim();
+    const jwtPayload = decodeJwtPayload(token);
+    const userId = String(jwtPayload?.sub || "").trim();
 
-    const {
-      data: { user },
-      error: authError,
-    } = await userClient.auth.getUser(token);
-
-    if (authError || !user) {
-      return jsonResponse(
-        {
-          error: "Unauthorized",
-          details: authError?.message || "No user returned from token",
-        },
-        401,
-      );
+    if (!userId) {
+      return jsonResponse({ error: "Unauthorized", details: "Token did not include a user id" }, 401);
     }
 
     const body = (await req.json()) as RequestBody;
@@ -85,11 +71,6 @@ serve(async (req) => {
       ? body.photo_urls.filter(Boolean).slice(0, 5)
       : [];
 
-    const accountFirstName = String(user.user_metadata?.first_name || "").trim();
-    const accountLastName = String(user.user_metadata?.last_name || "").trim();
-    const accountPhone = String(user.user_metadata?.phone || user.user_metadata?.phone_number || "").trim();
-    const accountEmail = user.email || "";
-
     if (!displayName) {
       return jsonResponse({ error: "name_display is required" }, 400);
     }
@@ -102,13 +83,12 @@ serve(async (req) => {
 
     const parentProfile = await getOrCreateFamilyProfile(
       adminClient,
-      user.id,
-      accountEmail,
+      userId,
       displayName,
       body.family_profile_id,
     );
 
-    const riskProfile = await getOrCreateUserRiskProfile(adminClient, user.id);
+    const riskProfile = await getOrCreateUserRiskProfile(adminClient, userId);
     const accountStatus = riskProfile.account_status || "normal";
     const accountIsQueued = accountStatus === "queued";
 
@@ -137,8 +117,6 @@ serve(async (req) => {
       version_number: nextVersionNumber,
       submitted_at: nowIso,
       name_display: displayName,
-      email: accountEmail,
-      phone: accountPhone || null,
       location,
       care_types_needed: careTypesNeeded,
       has_cats: !!body.has_cats,
@@ -151,8 +129,6 @@ serve(async (req) => {
       bio: bio || null,
       photo_urls: photoUrls,
       photo_url: photoUrls[0] || null,
-      first_name: accountFirstName || null,
-      last_name: accountLastName || null,
       content_status: contentStatus,
       review_status: reviewStatus,
       flag_trigger_type: "none",
@@ -176,10 +152,6 @@ serve(async (req) => {
 
     const parentUpdatePayload: Record<string, unknown> = {
       name_display: displayName,
-      email: accountEmail,
-      phone: accountPhone || null,
-      first_name: accountFirstName || null,
-      last_name: accountLastName || null,
       location,
       care_types_needed: careTypesNeeded,
       has_cats: !!body.has_cats,
@@ -217,7 +189,7 @@ serve(async (req) => {
 
     if (contentStatus === "queued") {
       await createQueueItemIfMissing(adminClient, {
-        userId: user.id,
+        userId,
         queueType: "family_profile",
         summary: `Queued family profile: ${displayName}`,
         relatedTable: "family_profile_versions",
@@ -243,7 +215,6 @@ serve(async (req) => {
 async function getOrCreateFamilyProfile(
   adminClient: ReturnType<typeof createClient>,
   userId: string,
-  email: string,
   displayName: string,
   familyProfileId?: string,
 ) {
@@ -282,7 +253,6 @@ async function getOrCreateFamilyProfile(
     .from("family_profiles")
     .insert({
       user_id: userId,
-      email,
       name_display: displayName,
       is_active: false,
       confirmed_encounters: 0,
@@ -475,4 +445,16 @@ function jsonResponse(payload: unknown, status = 200) {
       "Content-Type": "application/json",
     },
   });
+}
+
+function decodeJwtPayload(token: string) {
+  try {
+    const [, payloadSegment] = token.split(".");
+    if (!payloadSegment) return null;
+    const normalized = payloadSegment.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
 }
